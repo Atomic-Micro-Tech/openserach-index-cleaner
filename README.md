@@ -9,6 +9,7 @@ Script Python untuk menghapus index OpenSearch yang lebih tua dari batas retensi
 - [Struktur File](#struktur-file)
 - [Langkah 1 — Siapkan Script](#langkah-1--siapkan-script)
 - [Langkah 2 — Buat File Environment](#langkah-2--buat-file-environment)
+- [Menggunakan File .env (Opsional)](#menggunakan-file-env-opsional)
 - [Langkah 3 — Buat systemd Service](#langkah-3--buat-systemd-service)
 - [Langkah 4 — Buat systemd Timer](#langkah-4--buat-systemd-timer)
 - [Langkah 5 — Aktifkan Timer](#langkah-5--aktifkan-timer)
@@ -138,6 +139,49 @@ sudo mkdir -p /var/log/hapus-index
 sudo chown opensearch-cleanup:opensearch-cleanup /var/log/hapus-index
 sudo chmod 750 /var/log/hapus-index
 ```
+
+## Menggunakan File .env (Opsional)
+
+Script dapat memuat konfigurasi sendiri dari file `.env`, tanpa bergantung pada `EnvironmentFile=` systemd. Ini berguna untuk eksekusi manual, cron, Docker, atau pengujian lokal.
+
+```bash
+# Muat file tertentu
+python3 hapus-index-lama.py --env-file /etc/hapus-index/hapus-index.env --once --dry-run
+
+# Tanpa --env-file, script otomatis memuat .env di direktori kerja bila ada
+python3 hapus-index-lama.py --once
+
+# Abaikan file .env sepenuhnya
+python3 hapus-index-lama.py --no-env-file --once
+```
+
+Nama file juga dapat diberikan lewat environment variable `ENV_FILE`:
+
+```bash
+ENV_FILE=/etc/hapus-index/hapus-index.env python3 hapus-index-lama.py --once
+```
+
+Contoh isi file:
+
+```ini
+# komentar di awal baris diabaikan
+OPENSEARCH_URL=https://localhost:9200
+export RETENTION_DAYS=30
+INDEX_PATTERN="logstash-*,filebeat-*"   # komentar setelah nilai
+EXCLUDE_PATTERN='logstash-important-*'
+OPENSEARCH_PASSWORD="p@ss word#1"
+```
+
+Aturan parsing:
+
+- Format `KEY=VALUE`; awalan `export ` diperbolehkan.
+- Nilai boleh memakai kutip ganda (mendukung escape `\n`, `\t`, `\r`, `\"`, `\\`, `\$`) atau kutip tunggal (literal).
+- Komentar `#` di awal baris selalu diabaikan. Komentar di akhir baris hanya berlaku bila didahului spasi dan nilai tidak dikutip.
+- Variabel yang sudah ada di environment **tidak** ditimpa oleh isi file.
+- Urutan prioritas nilai: argumen CLI → environment variable → isi `.env` → nilai default.
+- `--no-env-file` membatalkan pemuatan `.env`, termasuk yang ditunjuk `ENV_FILE`.
+- File yang ditunjuk `--env-file`/`ENV_FILE` wajib ada; bila tidak, script berhenti dengan exit code `2`.
+- Path relatif dihitung dari direktori kerja saat script dijalankan, bukan dari lokasi script.
 
 ## Langkah 3 — Buat systemd Service
 
@@ -283,10 +327,12 @@ Tue 2026-10-27 01:00:00 WIB 13h left Mon 2026-10-26 01:00:00 WIB 10h ago  hapus-
 
 ## Referensi Opsi Script
 
-Semua opsi dapat diberikan lewat CLI atau environment variable.
+Semua opsi dapat diberikan lewat CLI, environment variable, atau file `.env` (lihat [Menggunakan File .env](#menggunakan-file-env-opsional)).
 
 | Argumen | Environment | Default | Keterangan |
 | --- | --- | --- | --- |
+| `--env-file` | `ENV_FILE` | `.env` bila ada | Muat konfigurasi dari file `.env` |
+| `--no-env-file` | — | mati | Jangan memuat file `.env` |
 | `--url` | `OPENSEARCH_URL` | `http://localhost:9200` | Endpoint OpenSearch |
 | `--pattern` | `INDEX_PATTERN` | `*` | Pola index diproses, pisahkan koma |
 | `--exclude` | `EXCLUDE_PATTERN` | kosong | Pola index yang dilindungi |

@@ -14,10 +14,13 @@ Contoh pemakaian:
     # Mode sekali jalan, cocok dipanggil dari cron pukul 01:00
     python3 hapus-index-lama.py --once
 
+    # Muat konfigurasi dari file .env
+    python3 hapus-index-lama.py --env-file /etc/hapus-index/hapus-index.env --once
+
     # Cron (alternatif jika tidak ingin proses selalu berjalan)
     0 1 * * * /usr/bin/python3 /path/hapus-index-lama.py --once >> /var/log/hapus-index.log 2>&1
 
-Konfigurasi dapat diberikan lewat argumen CLI atau environment variable.
+Konfigurasi dapat diberikan lewat argumen CLI, environment variable, atau file .env.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import time
@@ -47,6 +51,18 @@ except ImportError:  # Python < 3.9
 LOGGER = logging.getLogger("hapus-index-lama")
 MS_PER_DAY = 86_400_000
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+DEFAULT_ENV_FILE = ".env"
+ENV_FILE_VARIABLE = "ENV_FILE"
+ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+ENV_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+    "$": "$",
+}
 
 
 class ConfigError(Exception):
@@ -85,6 +101,7 @@ class Settings:
     retries: int
     verbose: bool
     log_file: Optional[str]
+    env_file: Optional[str]
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -137,11 +154,95 @@ def parse_patterns(value: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
     return patterns or default
 
 
+def parse_env_value(raw: str, origin: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+
+    quote = value[0]
+    if quote in {'"', "'"}:
+        end = 1
+        while end < len(value):
+            if quote == '"' and value[end] == "\\":
+                end += 2
+                continue
+            if value[end] == quote:
+                break
+            end += 1
+        if end >= len(value):
+            raise ConfigError(f"{origin}: tanda kutip penutup tidak ditemukan")
+        trailing = value[end + 1:].strip()
+        if trailing and not trailing.startswith("#"):
+            raise ConfigError(f"{origin}: teks setelah tanda kutip penutup: {trailing!r}")
+        inner = value[1:end]
+        if quote == "'":
+            return inner
+        result = []
+        index = 0
+        while index < len(inner):
+            char = inner[index]
+            if char == "\\" and index + 1 < len(inner):
+                escape = ENV_ESCAPES.get(inner[index + 1])
+                if escape is not None:
+                    result.append(escape)
+                    index += 2
+                    continue
+            result.append(char)
+            index += 1
+        return "".join(result)
+
+    for index, char in enumerate(value):
+        if char == "#" and index > 0 and value[index - 1] in " \t":
+            value = value[:index]
+            break
+    return value.rstrip()
+
+
+def load_env_file(path: str) -> None:
+    """Muat KEY=VALUE dari file .env tanpa menimpa environment yang sudah ada."""
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        raise ConfigError(f"gagal membaca file .env {path}: {exc}") from None
+
+    for lineno, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise ConfigError(f"{path}:{lineno}: baris harus berformat KEY=VALUE")
+        key = key.strip()
+        if not ENV_KEY_PATTERN.match(key):
+            raise ConfigError(f"{path}:{lineno}: nama variabel tidak valid: {key!r}")
+        os.environ.setdefault(key, parse_env_value(value, f"{path}:{lineno}"))
+
+
+def resolve_env_file(argv: Sequence[str]) -> Optional[str]:
+    preparser = argparse.ArgumentParser(add_help=False)
+    preparser.add_argument("--env-file", default=os.environ.get(ENV_FILE_VARIABLE, ""))
+    preparser.add_argument("--no-env-file", action="store_true")
+    known, _ = preparser.parse_known_args(argv)
+
+    if known.no_env_file:
+        return None
+    explicit = known.env_file.strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    if os.path.isfile(DEFAULT_ENV_FILE):
+        return DEFAULT_ENV_FILE
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Hapus index OpenSearch yang lebih tua dari batas retensi.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Environment variable:
+  ENV_FILE                File .env yang dimuat otomatis (default: .env jika ada)
   OPENSEARCH_URL          URL OpenSearch (default: http://localhost:9200)
   OPENSEARCH_USER         Username basic auth
   OPENSEARCH_PASSWORD     Password basic auth
@@ -162,10 +263,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 Contoh:
   python3 hapus-index-lama.py --once --dry-run
+  python3 hapus-index-lama.py --env-file /etc/hapus-index/hapus-index.env --once
   python3 hapus-index-lama.py --pattern 'logstash-*,filebeat-*' --retention-days 14
   python3 hapus-index-lama.py --time 01:00 --timezone Asia/Jakarta
 """,
     )
+    parser.add_argument("--env-file", default=None,
+                        help="Muat konfigurasi dari file .env (default: .env bila ada)")
+    parser.add_argument("--no-env-file", action="store_true",
+                        help="Jangan memuat file .env")
     parser.add_argument("--url", default=os.environ.get("OPENSEARCH_URL", "http://localhost:9200"),
                         help="URL OpenSearch")
     parser.add_argument("--pattern", default=os.environ.get("INDEX_PATTERN", "*"),
@@ -217,6 +323,11 @@ Contoh:
 
 
 def build_settings(argv: Optional[Sequence[str]] = None) -> Settings:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    env_file = resolve_env_file(argv)
+    if env_file:
+        load_env_file(env_file)
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -290,6 +401,7 @@ def build_settings(argv: Optional[Sequence[str]] = None) -> Settings:
         retries=args.retries,
         verbose=args.verbose,
         log_file=log_file,
+        env_file=env_file,
     )
 
 
@@ -599,6 +711,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     setup_logging(settings.verbose, settings.log_file)
+    if settings.env_file:
+        LOGGER.info("Konfigurasi .env dimuat dari %s", settings.env_file)
     if "*" in settings.patterns:
         LOGGER.warning(
             "Pola '*' memproses semua index non-tersembunyi; "
